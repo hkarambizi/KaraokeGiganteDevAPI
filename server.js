@@ -120,7 +120,10 @@ mongoose
 	});
 
 // ─── AUTH-ENDPOINT (always available) ─────────────────────────────────────────
-if (process.env.NODE_ENV == "development" && !!process.env.FIREBASE_API_KEY) {
+if (
+	["development", "ci"].includes(process.env.NODE_ENV) &&
+	!!process.env.FIREBASE_API_KEY
+) {
 	logger.warn("Development mode detected - exposing custom token endpoint");
 	app.post("/auth/customToken", async (req, res) => {
 		// Testing in development mode
