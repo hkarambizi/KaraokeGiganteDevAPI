@@ -29,7 +29,7 @@ logger.info("Firebase Admin SDK initialized successfully");
 async function authenticate(req, res, next) {
 	// If auth is disabled, skip verification
 	if (process.env.AUTH !== "ACTIVE") {
-		logger.debug("Authentication bypassed - AUTH is not active");
+		logger.info("Authentication bypassed - AUTH is not active");
 		return next();
 	}
 
@@ -103,8 +103,12 @@ app.use(cors());
 app.use(bodyParser.json({ limit: "5mb" }));
 
 logger.info("Connecting to MongoDB...");
+const mongoUri =
+	process.env.NODE_ENV !== "development"
+		? process.env.MONGO_URI
+		: "mongodb://localhost:27017/karaoke-gigante";
 mongoose
-	.connect(process.env.MONGO_URI, {
+	.connect(mongoUri, {
 		useNewUrlParser: true,
 		useUnifiedTopology: true,
 	})
