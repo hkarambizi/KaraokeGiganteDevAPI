@@ -431,6 +431,71 @@ app.delete("/requests/:id/fulfill", async (req, res) => {
 	}
 });
 
+// ─── USER SIGNUP ENDPOINT ─────────────────────────────────────────────────────────
+app.post("/signup", async (req, res) => {
+	const { phoneNumber, displayName, firstName, lastName } = req.body;
+	logger.info("User signup requested", { phoneNumber, displayName });
+
+	// Validate required fields
+	if (!phoneNumber || !displayName) {
+		logger.warn("Missing required fields for signup", req.body);
+		return res.status(400).json({
+			error: "Phone number and display name are required",
+		});
+	}
+
+	// Validate phone number format (10 digits, no dashes or spaces)
+	if (!/^\d{10}$/.test(phoneNumber)) {
+		logger.warn("Invalid phone number format", { phoneNumber });
+		return res.status(400).json({
+			error: "Phone number must be 10 digits with no dashes or spaces",
+		});
+	}
+
+	try {
+		// Check if user already exists with this phone number
+		const existingUser = await User.findOne({ phoneNumber });
+		if (existingUser) {
+			logger.warn("User already exists with this phone number", { phoneNumber });
+			return res.status(400).json({ error: "User already exists" });
+		}
+
+		// Create new user
+		const newUser = await User.create({
+			phoneNumber,
+			displayName,
+			firstName,
+			lastName,
+			// Any other fields from req.body can be added here
+		});
+
+		logger.info("New user created successfully", {
+			userId: newUser._id,
+			phoneNumber,
+			displayName,
+		});
+
+		// Return the new user (excluding sensitive fields if any)
+		res.status(201).json({
+			user: {
+				id: newUser._id,
+				phoneNumber: newUser.phoneNumber,
+				displayName: newUser.displayName,
+				firstName: newUser.firstName,
+				lastName: newUser.lastName,
+			},
+		});
+	} catch (err) {
+		logger.error("Error creating new user", {
+			phoneNumber,
+			displayName,
+			error: err.message,
+			stack: err.stack,
+		});
+		res.status(500).json({ error: "Failed to create new user" });
+	}
+});
+
 // ─── PHONE VERIFICATION ENDPOINTS ────────────────────────────────────────────────
 app.post("/start-phone-verification", async (req, res) => {
 	const { phoneNumber } = req.body;
