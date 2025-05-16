@@ -65,7 +65,7 @@ const userSchema = new Schema(
 		displayName: String,
 		avatar: Buffer,
 		lastLoginCode: String, // 6-digit verification code
-		codeExpiry: Date,      // When the verification code expires
+		codeExpiry: Date, // When the verification code expires
 	},
 	{ timestamps: true }
 );
@@ -433,124 +433,141 @@ app.delete("/requests/:id/fulfill", async (req, res) => {
 
 // ─── PHONE VERIFICATION ENDPOINTS ────────────────────────────────────────────────
 app.post("/start-phone-verification", async (req, res) => {
-  const { phoneNumber } = req.body;
-  logger.info("Phone verification requested", { phoneNumber });
-  
-  // Validate phone number format (10 digits, no dashes)
-  if (!phoneNumber || !/^\d{10}$/.test(phoneNumber)) {
-    logger.warn("Invalid phone number format", { phoneNumber });
-    return res.status(400).json({ error: "Please provide a valid 10-digit phone number with no dashes" });
-  }
-  
-  try {
-    // Check if user exists
-    let user = await User.findOne({ phoneNumber });
-    
-    if (!user) {
-      logger.warn("No user found with provided phone number", { phoneNumber });
-      return res.status(404).json({ error: "No user found with this phone number" });
-    }
-    
-    // Generate random 6-digit code
-    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
-    
-    // Set code expiration (10 minutes from now)
-    const codeExpiry = new Date();
-    codeExpiry.setMinutes(codeExpiry.getMinutes() + 10);
-    
-    // Save code to user
-    user.lastLoginCode = verificationCode;
-    user.codeExpiry = codeExpiry;
-    await user.save();
-    
-    logger.info("Verification code generated", { phoneNumber, userId: user._id });
-    
-    // Return the code and user (in a real production app, the code would be sent via SMS)
-    res.json({ 
-      code: verificationCode, 
-      user: {
-        _id: user._id,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        phoneNumber: user.phoneNumber,
-        displayName: user.displayName
-      } 
-    });
-  } catch (err) {
-    logger.error("Error generating verification code", {
-      phoneNumber,
-      error: err.message,
-      stack: err.stack,
-    });
-    res.status(500).json({ error: "Failed to generate verification code" });
-  }
+	const { phoneNumber } = req.body;
+	logger.info("Phone verification requested", { phoneNumber });
+
+	// Validate phone number format (10 digits, no dashes)
+	if (!phoneNumber || !/^\d{10}$/.test(phoneNumber)) {
+		logger.warn("Invalid phone number format", { phoneNumber });
+		return res
+			.status(400)
+			.json({
+				error: "Please provide a valid 10-digit phone number with no dashes",
+			});
+	}
+
+	try {
+		// Check if user exists
+		let user = await User.findOne({ phoneNumber });
+
+		if (!user) {
+			logger.warn("No user found with provided phone number", { phoneNumber });
+			return res
+				.status(404)
+				.json({ error: "No user found with this phone number" });
+		}
+
+		// Generate random 6-digit code
+		const verificationCode = Math.floor(
+			100000 + Math.random() * 900000
+		).toString();
+
+		// Set code expiration (10 minutes from now)
+		const codeExpiry = new Date();
+		codeExpiry.setMinutes(codeExpiry.getMinutes() + 10);
+
+		// Save code to user
+		user.lastLoginCode = verificationCode;
+		user.codeExpiry = codeExpiry;
+		await user.save();
+
+		logger.info("Verification code generated", {
+			phoneNumber,
+			userId: user._id,
+		});
+
+		// Return the code and user (in a real production app, the code would be sent via SMS)
+		res.json({
+			code: verificationCode,
+			user: {
+				_id: user._id,
+				firstName: user.firstName,
+				lastName: user.lastName,
+				phoneNumber: user.phoneNumber,
+				displayName: user.displayName,
+			},
+		});
+	} catch (err) {
+		logger.error("Error generating verification code", {
+			phoneNumber,
+			error: err.message,
+			stack: err.stack,
+		});
+		res.status(500).json({ error: "Failed to generate verification code" });
+	}
 });
 
 app.post("/verify-phone-code", async (req, res) => {
-  const { phoneNumber, code } = req.body;
-  logger.info("Phone code verification requested", { phoneNumber });
-  
-  if (!phoneNumber || !code) {
-    logger.warn("Missing required parameters", { phoneNumber, code });
-    return res.status(400).json({ error: "Phone number and verification code are required" });
-  }
-  
-  try {
-    // Find user by phone number
-    const user = await User.findOne({ phoneNumber });
-    
-    if (!user) {
-      logger.warn("No user found with provided phone number", { phoneNumber });
-      return res.status(404).json({ error: "No user found with this phone number" });
-    }
-    
-    // Check if code matches and is not expired
-    const now = new Date();
-    if (user.lastLoginCode !== code) {
-      logger.warn("Invalid verification code", { phoneNumber });
-      return res.status(400).json({ error: "Invalid verification code" });
-    }
-    
-    if (!user.codeExpiry || now > user.codeExpiry) {
-      logger.warn("Verification code expired", { phoneNumber });
-      return res.status(400).json({ error: "Verification code has expired" });
-    }
-    
-    // Code is valid - following the same pattern as /auth/customToken endpoint
-    try {
-      const uid = user.displayName || user._id;
-      const additionalClaims = { role: "user" };
-      const customToken = await admin
-        .auth()
-        .createCustomToken(uid, additionalClaims);
-      const token = await exchangeCustomTokenForIdToken(
-        customToken,
-        process.env.FIREBASE_API_KEY
-      );
-      
-      // Clear the verification code after successful verification
-      user.lastLoginCode = null;
-      user.codeExpiry = null;
-      await user.save();
-      
-      logger.info("Phone verification successful, token created", { userId: user._id });
-      res.json({ token, user });
-    } catch (err) {
-      logger.error("Failed to create token after verification", {
-        userId: user._id,
-        error: err.message,
-        stack: err.stack,
-      });
-      res.status(500).json({ error: "Failed to create authentication token" });
-    }
-  } catch (err) {
-    logger.error("Error verifying phone code", {
-      phoneNumber,
-      error: err.message,
-      stack: err.stack,
-    });
-    res.status(500).json({ error: "Failed to verify phone code" });
-  }
+	const { phoneNumber, code } = req.body;
+	logger.info("Phone code verification requested", { phoneNumber });
+
+	if (!phoneNumber || !code) {
+		logger.warn("Missing required parameters", { phoneNumber, code });
+		return res
+			.status(400)
+			.json({ error: "Phone number and verification code are required" });
+	}
+
+	try {
+		// Find user by phone number
+		const user = await User.findOne({ phoneNumber });
+
+		if (!user) {
+			logger.warn("No user found with provided phone number", { phoneNumber });
+			return res
+				.status(404)
+				.json({ error: "No user found with this phone number" });
+		}
+
+		// Check if code matches and is not expired
+		const now = new Date();
+		if (user.lastLoginCode !== code) {
+			logger.warn("Invalid verification code", { phoneNumber });
+			return res.status(400).json({ error: "Invalid verification code" });
+		}
+
+		if (!user.codeExpiry || now > user.codeExpiry) {
+			logger.warn("Verification code expired", { phoneNumber });
+			return res.status(400).json({ error: "Verification code has expired" });
+		}
+
+		// Code is valid - following the same pattern as /auth/customToken endpoint
+		try {
+			const uid = user.displayName || user._id;
+			const additionalClaims = { role: "user" };
+			const customToken = await admin
+				.auth()
+				.createCustomToken(uid, additionalClaims);
+			const token = await exchangeCustomTokenForIdToken(
+				customToken,
+				process.env.FIREBASE_API_KEY
+			);
+
+			// Clear the verification code after successful verification
+			user.lastLoginCode = null;
+			user.codeExpiry = null;
+			await user.save();
+
+			logger.info("Phone verification successful, token created", {
+				userId: user._id,
+			});
+			res.json({ token, user });
+		} catch (err) {
+			logger.error("Failed to create token after verification", {
+				userId: user._id,
+				error: err.message,
+				stack: err.stack,
+			});
+			res.status(500).json({ error: "Failed to create authentication token" });
+		}
+	} catch (err) {
+		logger.error("Error verifying phone code", {
+			phoneNumber,
+			error: err.message,
+			stack: err.stack,
+		});
+		res.status(500).json({ error: "Failed to verify phone code" });
+	}
 });
 
 // ─── START SERVER ─────────────────────────────────────────────────────────────
