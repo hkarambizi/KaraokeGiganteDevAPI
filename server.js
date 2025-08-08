@@ -58,7 +58,6 @@ const { Schema } = mongoose;
 
 const userSchema = new Schema(
 	{
-		_id: { type: String, default: "1" },
 		firstName: String,
 		lastName: String,
 		phoneNumber: String,
@@ -456,7 +455,9 @@ app.post("/signup", async (req, res) => {
 		// Check if user already exists with this phone number
 		const existingUser = await User.findOne({ phoneNumber });
 		if (existingUser) {
-			logger.warn("User already exists with this phone number", { phoneNumber });
+			logger.warn("User already exists with this phone number", {
+				phoneNumber,
+			});
 			return res.status(400).json({ error: "User already exists" });
 		}
 
@@ -504,11 +505,9 @@ app.post("/start-phone-verification", async (req, res) => {
 	// Validate phone number format (10 digits, no dashes)
 	if (!phoneNumber || !/^\d{10}$/.test(phoneNumber)) {
 		logger.warn("Invalid phone number format", { phoneNumber });
-		return res
-			.status(400)
-			.json({
-				error: "Please provide a valid 10-digit phone number with no dashes",
-			});
+		return res.status(400).json({
+			error: "Please provide a valid 10-digit phone number with no dashes",
+		});
 	}
 
 	try {
