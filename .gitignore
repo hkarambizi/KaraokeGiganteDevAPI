@@ -7,7 +7,7 @@ yarn-error.log*
 # TypeScript
 dist/
 *.tsbuildinfo
-
+docs/
 # Environment variables
 .env
 .env.local
