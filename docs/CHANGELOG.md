@@ -1,6 +1,6 @@
 # 📋 Changelog - Karaoke Gigante API
 
-**Last Updated:** 2025-11-03  
+**Last Updated:** 2025-11-03
 **Format:** Date/Time sorted entries with clear titles and descriptions
 
 ---
@@ -8,7 +8,7 @@
 ## 2025-11-03
 ### 📝 Org Creation Contract & Clerk Requirements (Backend)
 
-**Time:** 07:15:00 UTC  
+**Time:** 07:15:00 UTC
 **Description:** Aligned API contracts and clarified Clerk requirements for organization creation. Added detailed error mapping/logging.
 
 **Changes:**
@@ -31,7 +31,7 @@
 ---
 ### 📝 API Contracts v4.0.1 + Explicit users/me methods (Backend)
 
-**Time:** 07:46:00 UTC  
+**Time:** 07:46:00 UTC
 **Description:** Contracts bumped to v4.0.1. Explicit support for GET and POST /api/users/me. Frontend should sync contracts and prefer GET for profile fetch.
 
 **Changes:**
