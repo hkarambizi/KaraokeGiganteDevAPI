@@ -4,67 +4,52 @@ import mongoose from "mongoose";
 import bodyParser from "body-parser";
 import cors from "cors";
 import dotenv from "dotenv";
-import admin from "firebase-admin";
 import logger from "./utils/logger.js";
 
 import spotifyRouter from "./controllers/spotifyController.js";
-import { exchangeCustomTokenForIdToken } from "./utils/tokenExchange.js";
+import {
+	verifyTokenWithCache,
+	clearUserCache,
+	getCacheStats,
+} from "./middleware/tokenCache.js";
+import { syncUser } from "./middleware/userSync.js";
+import { smsService } from "./services/smsService.js";
 
-dotenv.config(); // loads AUTH, MONGO_URI, FIREBASE_* from .env
+dotenv.config(); // loads AUTH, MONGO_URI, CLERK_* from .env
 logger.info("Environment configuration loaded");
 
-// ─── FIREBASE ADMIN INIT ───────────────────────────────────────────────────────
+// ─── CLERK CONFIGURATION ───────────────────────────────────────────────────────
 
-logger.info("Initializing Firebase Admin SDK");
-admin.initializeApp({
-	credential: admin.credential.cert({
-		projectId: process.env.FIREBASE_PROJECT_ID,
-		clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-		privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-	}),
+logger.info("Clerk authentication configured", {
+	domain: process.env.CLERK_DOMAIN,
+	applicationId: process.env.CLERK_APPLICATION_ID,
 });
-logger.info("Firebase Admin SDK initialized successfully");
 
 // ─── AUTH MIDDLEWARE ────────────────────────────────────────────────────────────
-async function authenticate(req, res, next) {
-	// If auth is disabled, skip verification
-	if (process.env.AUTH !== "ACTIVE") {
-		logger.info("Authentication bypassed - AUTH is not active");
-		return next();
-	}
-
-	const header = req.headers.authorization || "";
-	if (!header.startsWith("Bearer ")) {
-		logger.warn("Authentication failed - Missing Bearer token");
-		return res.status(401).json({ error: "Missing Bearer token" });
-	}
-
-	const idToken = header.split(" ")[1];
-	try {
-		const decoded = await admin.auth().verifyIdToken(idToken);
-		req.user = decoded;
-		logger.debug("User authenticated successfully", { uid: decoded.uid });
-		next();
-	} catch (err) {
-		logger.warn("Authentication failed - Invalid token", {
-			error: err.message,
-		});
-		res.status(401).json({ error: "Invalid ID token" });
-	}
-}
+// Note: authenticate function is now imported from middleware/auth.js
 
 // ─── MONGOOSE MODELS ────────────────────────────────────────────────────────────
 const { Schema } = mongoose;
 
 const userSchema = new Schema(
 	{
+		clerkUserId: { type: String, unique: true, required: true }, // Clerk's user ID
+		email: String,
 		firstName: String,
 		lastName: String,
+		username: String,
 		phoneNumber: String,
 		displayName: String,
+		profileImage: String,
 		avatar: Buffer,
 		lastLoginCode: String, // 6-digit verification code
 		codeExpiry: Date, // When the verification code expires
+		pushToken: String, // Expo push token for notifications
+		// App-specific fields
+		queuePosition: { type: Number, default: 0 },
+		songsRequested: { type: Number, default: 0 },
+		achievements: [String],
+		preferences: { type: Object, default: {} },
 	},
 	{ timestamps: true }
 );
@@ -82,6 +67,7 @@ const songSchema = new Schema(
 
 const requestSchema = new Schema(
 	{
+		clerkUserId: { type: String, required: true }, // Clerk user ID
 		firstName: String,
 		displayName: String,
 		phoneNumber: String,
@@ -103,6 +89,9 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: "5mb" }));
 
+// Make User model available to middleware
+app.locals.User = User;
+
 logger.info("Connecting to MongoDB...");
 const mongoUri =
 	process.env.NODE_ENV !== "development"
@@ -120,50 +109,25 @@ mongoose
 		logger.error("MongoDB connection error", { error: err.message });
 	});
 
-// ─── AUTH-ENDPOINT (always available) ─────────────────────────────────────────
-if (
-	["development", "ci"].includes(process.env.NODE_ENV) &&
-	!!process.env.FIREBASE_API_KEY
-) {
-	logger.warn("Development mode detected - exposing custom token endpoint");
-	app.post("/auth/customToken", async (req, res) => {
-		// Testing in development mode
-
-		const { phoneNumber } = req.body;
-		logger.info("Custom token requested with phoneNumber", { phoneNumber });
-		const registeredUser = await User.findOne({ phoneNumber });
-		if (!registeredUser) {
-			logger.warn("No user found with provided phoneNumber", { phoneNumber });
-			return res.status(400).json({ error: "User not found" });
-		}
-		try {
-			const uid = registeredUser.displayName || registeredUser._id;
-			const additionalClaims = { role: "admin" }; // Example additional claims
-			const customToken = await admin
-				.auth()
-				.createCustomToken(uid, additionalClaims);
-			const token = await exchangeCustomTokenForIdToken(
-				customToken,
-				process.env.FIREBASE_API_KEY
-			);
-			logger.info("Custom token created successfully", {
-				user: registeredUser._id,
-			});
-			res.json({ token, user: registeredUser });
-		} catch (err) {
-			logger.error("Failed to create custom token", {
-				uid,
-				error: err.message,
-				stack: err.stack,
-			});
-			res.status(500).json({ error: err.message });
-		}
+// ─── TEST AUTH ENDPOINT (development only) ─────────────────────────────────────
+if (["development", "ci"].includes(process.env.NODE_ENV)) {
+	logger.warn("Development mode detected - exposing test auth endpoint");
+	app.get("/api/test/auth", verifyTokenWithCache, syncUser, (req, res) => {
+		res.json({
+			message: "Authentication successful",
+			clerkUserId: req.clerkUserId,
+			userDoc: {
+				_id: req.userDoc._id,
+				clerkUserId: req.userDoc.clerkUserId,
+				email: req.userDoc.email,
+			},
+		});
 	});
 }
 
 // ─── PROTECT ROUTES ─────────────────────────────────────────────────────────────
 logger.info("Setting up protected routes");
-app.use(["/user", "/requests"], authenticate);
+app.use(["/user", "/requests"], verifyTokenWithCache, syncUser);
 
 // ─── SPOTIFY ROUTES ────────────────────────────────────────────────────────────
 logger.info("Setting up Spotify routes");
@@ -171,18 +135,18 @@ app.use("/spotify", spotifyRouter);
 
 // ─── USER ROUTES ───────────────────────────────────────────────────────────────
 app.get("/user", async (req, res) => {
-	logger.info("First user data requested");
+	logger.info("User data requested", { clerkUserId: req.clerkUserId });
 
 	try {
-		let user = await User.findOne();
-		if (!user) {
-			logger.info("No user found, creating new user");
-			user = await User.create({});
-		}
-		logger.debug("User data retrieved successfully", { userId: user._id });
-		res.json(user);
+		// User is already synced by middleware, just return the user document
+		logger.debug("User data retrieved successfully", {
+			userId: req.userDoc._id,
+			clerkUserId: req.userDoc.clerkUserId,
+		});
+		res.json(req.userDoc);
 	} catch (err) {
 		logger.error("Error fetching user data", {
+			clerkUserId: req.clerkUserId,
 			error: err.message,
 		});
 		res.status(500).json({ error: err.message });
@@ -190,8 +154,7 @@ app.get("/user", async (req, res) => {
 });
 
 app.put("/user", async (req, res) => {
-	const id = req.query.id || "1";
-	logger.info("Updating user data", { userId: id });
+	logger.info("Updating user data", { clerkUserId: req.clerkUserId });
 
 	try {
 		const update = (({
@@ -200,20 +163,40 @@ app.put("/user", async (req, res) => {
 			phoneNumber,
 			displayName,
 			avatar,
-		}) => ({ firstName, lastName, phoneNumber, displayName, avatar }))(
-			req.body
+			pushToken,
+			preferences,
+		}) => ({
+			firstName,
+			lastName,
+			phoneNumber,
+			displayName,
+			avatar,
+			pushToken,
+			preferences,
+			updatedAt: new Date(),
+		}))(req.body);
+
+		const user = await User.findOneAndUpdate(
+			{ clerkUserId: req.clerkUserId },
+			update,
+			{ new: true }
 		);
 
-		const user = await User.findByIdAndUpdate(id, update, {
-			new: true,
-			upsert: true,
-		});
+		if (!user) {
+			logger.warn("User not found for update", {
+				clerkUserId: req.clerkUserId,
+			});
+			return res.status(404).json({ error: "User not found" });
+		}
 
-		logger.info("User data updated successfully", { userId: id });
+		logger.info("User data updated successfully", {
+			clerkUserId: req.clerkUserId,
+			userId: user._id,
+		});
 		res.json(user);
 	} catch (err) {
 		logger.error("Error updating user data", {
-			userId: id,
+			clerkUserId: req.clerkUserId,
 			error: err.message,
 			stack: err.stack,
 		});
@@ -310,34 +293,38 @@ app.get("/requests/active", async (req, res) => {
 	}
 });
 app.post("/requests", async (req, res) => {
-	const { firstName, displayName, phoneNumber, songId, title, artist } =
-		req.body;
-	if (!firstName || !displayName || !phoneNumber) {
-		logger.warn("Invalid user data in song request", req.body);
-		return res.status(400).json({
-			error: "First name, display name, and phone number are required",
-		});
-	}
+	const { songId, title, artist } = req.body;
+
 	if (!songId || !title) {
 		logger.warn("Invalid song request data", req.body);
 		return res.status(400).json({ error: "Song ID and title are required" });
 	}
+
 	try {
+		// Get user data from the authenticated user
+		const user = req.userDoc;
+		const { firstName, displayName, phoneNumber } = user;
+
 		// Check if the user already has an active request
 		const existingUserRequest = await Request.findOne({
-			displayName,
-			fulfilled: false || undefined,
+			clerkUserId: req.clerkUserId,
+			fulfilled: { $ne: true },
 		});
 		if (existingUserRequest) {
-			logger.warn("User already has an active request", { displayName });
+			logger.warn("User already has an active request", {
+				clerkUserId: req.clerkUserId,
+				displayName,
+			});
 			return res.status(200).json({
 				error: "You already have an active song request",
 				request: existingUserRequest,
 			});
 		}
+
 		// Check if the song already has been requested
 		const existingRequest = await Request.findOne({
 			songId,
+			fulfilled: { $ne: true },
 		});
 		if (existingRequest) {
 			logger.warn("Song already requested", { songId });
@@ -346,9 +333,17 @@ app.post("/requests", async (req, res) => {
 				request: existingRequest,
 			});
 		}
-		logger.info("New song request received", { songId, title, displayName });
+
+		logger.info("New song request received", {
+			songId,
+			title,
+			clerkUserId: req.clerkUserId,
+			displayName,
+		});
+
 		const count = await Request.countDocuments();
 		const request = await Request.create({
+			clerkUserId: req.clerkUserId,
 			firstName,
 			displayName,
 			phoneNumber,
@@ -357,16 +352,19 @@ app.post("/requests", async (req, res) => {
 			artist,
 			position: count + 1,
 		});
+
 		logger.info("Song request created successfully", {
 			songId,
 			title,
 			position: count + 1,
+			clerkUserId: req.clerkUserId,
 		});
 		res.status(201).json(request);
 	} catch (err) {
 		logger.error("Error creating song request", {
 			songId,
 			title,
+			clerkUserId: req.clerkUserId,
 			error: err.message,
 			stack: err.stack,
 		});
@@ -540,9 +538,21 @@ app.post("/start-phone-verification", async (req, res) => {
 			userId: user._id,
 		});
 
-		// Return the code and user (in a real production app, the code would be sent via SMS)
-		res.json({
-			code: verificationCode,
+		// Send SMS with verification code
+		try {
+			const message = `Your Karaoke Gigante verification code is: ${verificationCode}. This code expires in 10 minutes.`;
+			await smsService.sendSMS(phoneNumber, message);
+			logger.info("Verification code sent via SMS", { phoneNumber });
+		} catch (smsError) {
+			logger.error("Failed to send SMS", {
+				phoneNumber,
+				error: smsError.message,
+			});
+			// Still return the code for development/testing
+		}
+
+		// Return the code and user (in development, also return the code)
+		const response = {
 			user: {
 				_id: user._id,
 				firstName: user.firstName,
@@ -550,7 +560,14 @@ app.post("/start-phone-verification", async (req, res) => {
 				phoneNumber: user.phoneNumber,
 				displayName: user.displayName,
 			},
-		});
+		};
+
+		// In development, also return the code for testing
+		if (process.env.NODE_ENV === "development") {
+			response.code = verificationCode;
+		}
+
+		res.json(response);
 	} catch (err) {
 		logger.error("Error generating verification code", {
 			phoneNumber,
@@ -595,35 +612,28 @@ app.post("/verify-phone-code", async (req, res) => {
 			return res.status(400).json({ error: "Verification code has expired" });
 		}
 
-		// Code is valid - following the same pattern as /auth/customToken endpoint
-		try {
-			const uid = user.displayName || user._id;
-			const additionalClaims = { role: "user" };
-			const customToken = await admin
-				.auth()
-				.createCustomToken(uid, additionalClaims);
-			const token = await exchangeCustomTokenForIdToken(
-				customToken,
-				process.env.FIREBASE_API_KEY
-			);
+		// Clear the verification code after successful verification
+		user.lastLoginCode = null;
+		user.codeExpiry = null;
+		await user.save();
 
-			// Clear the verification code after successful verification
-			user.lastLoginCode = null;
-			user.codeExpiry = null;
-			await user.save();
+		logger.info("Phone verification successful", {
+			userId: user._id,
+			clerkUserId: user.clerkUserId,
+		});
 
-			logger.info("Phone verification successful, token created", {
-				userId: user._id,
-			});
-			res.json({ token, user });
-		} catch (err) {
-			logger.error("Failed to create token after verification", {
-				userId: user._id,
-				error: err.message,
-				stack: err.stack,
-			});
-			res.status(500).json({ error: "Failed to create authentication token" });
-		}
+		// Return user data (authentication is now handled by Clerk on the frontend)
+		res.json({
+			message: "Phone verification successful",
+			user: {
+				_id: user._id,
+				clerkUserId: user.clerkUserId,
+				firstName: user.firstName,
+				lastName: user.lastName,
+				phoneNumber: user.phoneNumber,
+				displayName: user.displayName,
+			},
+		});
 	} catch (err) {
 		logger.error("Error verifying phone code", {
 			phoneNumber,
@@ -633,6 +643,65 @@ app.post("/verify-phone-code", async (req, res) => {
 		res.status(500).json({ error: "Failed to verify phone code" });
 	}
 });
+
+// ─── PUSH NOTIFICATION ENDPOINTS ─────────────────────────────────────────────
+app.post(
+	"/user/push-token",
+	verifyTokenWithCache,
+	syncUser,
+	async (req, res) => {
+		try {
+			const { pushToken } = req.body;
+
+			await User.findOneAndUpdate(
+				{ clerkUserId: req.clerkUserId },
+				{
+					pushToken,
+					updatedAt: new Date(),
+				}
+			);
+
+			logger.info("Push token stored successfully", {
+				clerkUserId: req.clerkUserId,
+			});
+			res.json({ success: true });
+		} catch (error) {
+			logger.error("Failed to store push token", {
+				clerkUserId: req.clerkUserId,
+				error: error.message,
+			});
+			res.status(500).json({ error: "Failed to store push token" });
+		}
+	}
+);
+
+// ─── CACHE MANAGEMENT ENDPOINTS (development only) ──────────────────────────
+if (["development", "ci"].includes(process.env.NODE_ENV)) {
+	// Get cache statistics
+	app.get("/api/cache/stats", (req, res) => {
+		const stats = getCacheStats();
+		res.json({
+			message: "Token cache statistics",
+			stats,
+		});
+	});
+
+	// Clear cache for a specific user
+	app.post("/api/cache/clear", (req, res) => {
+		const { clerkUserId } = req.body;
+		if (!clerkUserId) {
+			return res.status(400).json({ error: "clerkUserId is required" });
+		}
+		clearUserCache(clerkUserId);
+		res.json({ message: "Cache cleared for user", clerkUserId });
+	});
+
+	// Clear all cache
+	app.post("/api/cache/clear-all", (req, res) => {
+		// This would require implementing a clearAll function
+		res.json({ message: "Clear all cache endpoint - implement if needed" });
+	});
+}
 
 // ─── START SERVER ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
