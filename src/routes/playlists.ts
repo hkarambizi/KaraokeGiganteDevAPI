@@ -409,11 +409,15 @@ export async function playlistRoutes(fastify: FastifyInstance) {
                     false // Private playlist
                 );
 
-                // Get songs with Spotify IDs and construct URIs
+                // Get songs with Spotify sources and construct URIs
                 const songs = await Song.find({ _id: { $in: playlist.songIds } }).lean();
                 const spotifyUris = songs
-                    .filter((song) => song.spotifyId)
-                    .map((song) => `spotify:track:${song.spotifyId}`);
+                    .map((song) => {
+                        // Find Spotify source
+                        const spotifySource = song.sources.find((s) => s.source === 'spotify');
+                        return spotifySource ? `spotify:track:${spotifySource.sourceId}` : null;
+                    })
+                    .filter((uri): uri is string => uri !== null);
 
                 if (spotifyUris.length === 0) {
                     return reply.code(400).send({

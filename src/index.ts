@@ -16,6 +16,9 @@ import { deviceRoutes } from './routes/devices.js';
 import { broadcastRoutes } from './routes/broadcast.js';
 import { spotifyRoutes } from './routes/spotify.js';
 import { playlistRoutes } from './routes/playlists.js';
+import { catalogRoutes } from './routes/catalog.js';
+import { importRoutes } from './routes/imports.js';
+import { adminFixRoutes } from './routes/admin-fix.js';
 
 async function main() {
     // Create Fastify instance with logging
@@ -29,9 +32,32 @@ async function main() {
                         options: {
                             translateTime: 'HH:MM:ss Z',
                             ignore: 'pid,hostname',
+                            colorize: true,
+                            singleLine: false,
                         },
                     }
                     : undefined,
+            serializers: {
+                req: (req) => ({
+                    method: req.method,
+                    url: req.url,
+                    headers: env.NODE_ENV === 'development' ? req.headers : undefined,
+                    query: req.query,
+                    body: env.NODE_ENV === 'development' ? req.body : undefined,
+                }),
+                res: (res) => ({
+                    statusCode: res.statusCode,
+                    headers: env.NODE_ENV === 'development' ? res.headers : undefined,
+                }),
+                err: (err: any) => ({
+                    type: err.constructor?.name || 'Error',
+                    message: err.message,
+                    stack: env.NODE_ENV === 'development' ? (err.stack || '') : '',
+                    statusCode: err.statusCode,
+                    code: err.code,
+                    details: err.details || err.cause || err.issues,
+                }),
+            },
         },
         requestIdLogLabel: 'reqId',
         disableRequestLogging: false,
@@ -47,6 +73,47 @@ async function main() {
 
         // Connect to MongoDB
         await connectDatabase();
+
+        // Enhanced logging hooks for DEBUG mode
+        if (env.NODE_ENV === 'development') {
+            // Log request body in DEBUG mode (after body parsing)
+            fastify.addHook('preValidation', async (request) => {
+                if (request.body && Object.keys(request.body).length > 0) {
+                    request.log.debug({
+                        body: request.body,
+                        contentType: request.headers['content-type'],
+                    }, '📥 Request body');
+                }
+            });
+
+            // Log response body in DEBUG mode
+            fastify.addHook('onSend', async (request, reply, payload) => {
+                // Only log if response is JSON
+                const contentType = reply.getHeader('content-type');
+                if (typeof contentType === 'string' && contentType.includes('application/json')) {
+                    try {
+                        const body = typeof payload === 'string' ? JSON.parse(payload) : payload;
+                        request.log.debug({
+                            statusCode: reply.statusCode,
+                            responseBody: body,
+                        }, '📤 Response body');
+                    } catch (e) {
+                        // If payload is not JSON, log as-is (truncated)
+                        request.log.debug({
+                            statusCode: reply.statusCode,
+                            responsePreview: typeof payload === 'string'
+                                ? payload.substring(0, 200)
+                                : String(payload).substring(0, 200),
+                        }, '📤 Response body (non-JSON)');
+                    }
+                }
+            });
+
+            // Log validation errors in detail
+            fastify.setValidatorCompiler(() => {
+                return (data) => ({ value: data });
+            });
+        }
 
         // Health check
         fastify.get('/health', async () => {
@@ -73,14 +140,63 @@ async function main() {
         await fastify.register(spotifyRoutes, { prefix: '/api/spotify' });
         await fastify.register(playlistRoutes, { prefix: '/api/playlists' });
 
-        // Error handler
-        fastify.setErrorHandler((error, _request, reply) => {
-            fastify.log.error(error);
+        // Catalog Search & Import System
+        await fastify.register(catalogRoutes, { prefix: '/api/catalog' });
+        await fastify.register(importRoutes, { prefix: '/api/admin/imports' });
+        await fastify.register(adminFixRoutes, { prefix: '/api/admin' });
 
-            reply.status(error.statusCode || 500).send({
+        // Enhanced error handler with detailed logging
+        fastify.setErrorHandler((error, request, reply) => {
+            const statusCode = error.statusCode || 500;
+            const isValidationError = error.validation || error.name === 'ZodError';
+
+            // Enhanced error logging for DEBUG mode
+            if (env.NODE_ENV === 'development') {
+                const errorDetails: any = {
+                    err: error,
+                    type: error.constructor?.name || 'Error',
+                    message: error.message,
+                    stack: error.stack,
+                    statusCode: statusCode,
+                    code: error.code || 'INTERNAL_ERROR',
+                    requestBody: request.body,
+                    requestQuery: request.query,
+                    requestParams: request.params,
+                    url: request.url,
+                    method: request.method,
+                };
+
+                // Add validation/error details if they exist
+                if ('validation' in error) errorDetails.validation = (error as any).validation;
+                if ('issues' in error) errorDetails.issues = (error as any).issues;
+                if ('cause' in error) errorDetails.cause = (error as any).cause;
+
+                request.log.error(errorDetails, '❌ Error occurred');
+            } else {
+                // Production: log minimal details
+                fastify.log.error({
+                    err: error,
+                    statusCode: statusCode,
+                    code: error.code || 'INTERNAL_ERROR',
+                    url: request.url,
+                    method: request.method,
+                }, 'Error occurred');
+            }
+
+            // Prepare error response
+            const errorResponse: any = {
                 error: error.message || 'Internal Server Error',
-                code: 'INTERNAL_ERROR',
-            });
+                code: error.code || (isValidationError ? 'VALIDATION_ERROR' : 'INTERNAL_ERROR'),
+            };
+
+            // Add validation details in development
+            if (env.NODE_ENV === 'development' && isValidationError) {
+                const validationError = error as any;
+                errorResponse.details = validationError.validation || validationError.issues || validationError.cause;
+                errorResponse.stack = error.stack;
+            }
+
+            reply.status(statusCode).send(errorResponse);
         });
 
         // Start server

@@ -5,6 +5,8 @@ import { createClerkClient } from '@clerk/backend';
 import { Organization } from '../models/Organization.js';
 import { OrganizationInvite } from '../models/OrganizationInvite.js';
 import { User } from '../models/User.js';
+import { Host } from '../models/Host.js';
+import { syncOrganizationsFromClerk } from '../services/organizationSync.js';
 import { verifyClerkToken, requireAdmin } from '../middleware/auth.js';
 import { env } from '../config/env.js';
 
@@ -35,7 +37,7 @@ export async function organizationRoutes(fastify: FastifyInstance) {
                 const body = createOrgSchema.parse(request.body);
                 const clerkId = request.clerkId!;
 
-                // Check for duplicate slug
+                // Check for duplicate slug in MongoDB first
                 const existingOrg = await Organization.findOne({ slug: body.slug });
                 if (existingOrg) {
                     return reply.code(409).send({
@@ -44,19 +46,97 @@ export async function organizationRoutes(fastify: FastifyInstance) {
                     });
                 }
 
-                // Create Clerk organization
-                const clerkOrg = await clerk.organizations.createOrganization({
-                    name: body.name,
-                    slug: body.slug,
-                    createdBy: clerkId,
-                });
+                // Create Clerk organization (map Clerk conflicts to 409)
+                let clerkOrg: any;
+                try {
+                    clerkOrg = await clerk.organizations.createOrganization({
+                        name: body.name,
+                        slug: body.slug,
+                        createdBy: clerkId,
+                    });
+                } catch (clerkError: any) {
+                    request.log.error({
+                        clerkId,
+                        name: body.name,
+                        slug: body.slug,
+                        error: clerkError?.message,
+                        status: clerkError?.status,
+                        data: clerkError?.data,
+                    }, 'Clerk createOrganization failed');
 
-                // Add user as admin member in Clerk
-                await clerk.organizations.createOrganizationMembership({
-                    organizationId: clerkOrg.id,
-                    userId: clerkId,
-                    role: 'org:admin',
-                });
+                    // If Clerk reports slug conflict, return 409 to frontend
+                    const message = String(clerkError?.message || '').toLowerCase();
+                    if (clerkError?.status === 409 || message.includes('slug') || message.includes('already in use')) {
+                        return reply.code(409).send({
+                            error: 'Organization slug already exists in Clerk',
+                            code: 'SLUG_EXISTS_CLERK',
+                        });
+                    }
+
+                    return reply.code(502).send({
+                        error: 'Failed to create organization in Clerk',
+                        code: 'CLERK_ORG_CREATE_FAILED',
+                        details: env.NODE_ENV === 'development' ? clerkError?.message : undefined,
+                    });
+                }
+
+                // Add user as admin member in Clerk (skip if already a member)
+                try {
+                    // Check if membership already exists
+                    try {
+                        const existingMemberships = await clerk.organizations.getOrganizationMembershipList({
+                            organizationId: clerkOrg.id,
+                        });
+                        const alreadyMember = existingMemberships.data?.some(m => m.publicUserData?.userId === clerkId);
+                        if (!alreadyMember) {
+                            await clerk.organizations.createOrganizationMembership({
+                                organizationId: clerkOrg.id,
+                                userId: clerkId,
+                                role: 'org:admin',
+                            });
+                        } else {
+                            fastify.log.info({ clerkId, organizationId: clerkOrg.id }, 'User already a member of organization; skipping membership create');
+                        }
+                    } catch (listError: any) {
+                        // If listing fails, attempt to create membership directly
+                        fastify.log.warn({
+                            organizationId: clerkOrg.id,
+                            error: listError?.message,
+                        }, 'Failed to list memberships; attempting membership create');
+                        await clerk.organizations.createOrganizationMembership({
+                            organizationId: clerkOrg.id,
+                            userId: clerkId,
+                            role: 'org:admin',
+                        });
+                    }
+                } catch (membershipError: any) {
+                    request.log.error({
+                        clerkId,
+                        organizationId: clerkOrg?.id,
+                        error: membershipError?.message,
+                        status: membershipError?.status,
+                        data: membershipError?.data,
+                    }, 'Clerk createOrganizationMembership failed');
+
+                    // If Clerk indicates membership exists, continue as success
+                    const msg = String(membershipError?.message || '').toLowerCase();
+                    if (membershipError?.status === 409 || msg.includes('already') || msg.includes('exists')) {
+                        fastify.log.info({ clerkId, organizationId: clerkOrg.id }, 'Membership already exists; proceeding');
+                    } else {
+                        // Partial success: org created but membership failed - return org so frontend can recover
+                        return reply.code(502).send({
+                            error: 'Failed to add admin membership in Clerk',
+                            code: 'CLERK_MEMBERSHIP_CREATE_FAILED',
+                            details: env.NODE_ENV === 'development' ? membershipError?.message : undefined,
+                            partial: true,
+                            organization: {
+                                clerkOrgId: clerkOrg.id,
+                                name: body.name,
+                                slug: body.slug,
+                            },
+                        });
+                    }
+                }
 
                 // Create organization in MongoDB
                 const org = await Organization.create({
@@ -67,23 +147,30 @@ export async function organizationRoutes(fastify: FastifyInstance) {
                     createdBy: clerkId,
                 });
 
-                // Update user with admin role and orgId
-                await User.findOneAndUpdate(
-                    { clerkId },
-                    {
-                        role: 'admin',
-                        orgId: clerkOrg.id,
-                        updatedAt: new Date(),
-                    }
-                );
+                // Get user record
+                const user = await User.findOne({ clerkId });
+                if (!user) {
+                    return reply.code(404).send({
+                        error: 'User not found',
+                        code: 'USER_NOT_FOUND',
+                    });
+                }
 
-                // Update Clerk user metadata
-                await clerk.users.updateUser(clerkId, {
-                    publicMetadata: {
-                        role: 'admin',
-                        orgId: clerkOrg.id,
-                    },
-                });
+                // Create Host record if it doesn't exist
+                let host = await Host.findOne({ clerkId });
+                if (!host) {
+                    host = await Host.create({
+                        clerkId,
+                        userId: user._id,
+                        calendar: [],
+                        imports: [],
+                        currentView: 'host',
+                    });
+                    fastify.log.info(`Host record created for user ${clerkId}`);
+                } else {
+                    host.currentView = 'host';
+                    await host.save();
+                }
 
                 fastify.log.info(`Organization created: ${clerkOrg.id} by ${clerkId}`);
 
@@ -106,10 +193,14 @@ export async function organizationRoutes(fastify: FastifyInstance) {
                     });
                 }
 
-                fastify.log.error('Error creating organization:', error);
+                fastify.log.error({
+                    error: error?.message,
+                    stack: error?.stack,
+                }, 'Error creating organization');
                 return reply.code(500).send({
                     error: 'Failed to create organization',
                     code: 'ORG_CREATE_ERROR',
+                    details: env.NODE_ENV === 'development' ? error?.message : undefined,
                 });
             }
         }
@@ -130,16 +221,64 @@ export async function organizationRoutes(fastify: FastifyInstance) {
                     userId: clerkId,
                 });
 
-                // Fetch corresponding MongoDB records
-                const orgIds = clerkOrgs.data.map(m => m.organization.id);
-                const orgs = await Organization.find({ clerkOrgId: { $in: orgIds } }).lean();
+                fastify.log.debug({
+                    clerkId,
+                    clerkOrgCount: clerkOrgs.data.length,
+                    clerkOrgIds: clerkOrgs.data.map(m => m.organization.id),
+                }, 'Fetched Clerk organizations');
 
+                // Sync missing organizations from Clerk to MongoDB
+                const clerkOrgIds = clerkOrgs.data.map(m => m.organization.id);
+                if (clerkOrgIds.length > 0) {
+                    try {
+                        // Pass clerkId so sync can use user's MongoDB _id for createdBy
+                        await syncOrganizationsFromClerk(clerkOrgIds, clerkId);
+                        fastify.log.debug({ clerkOrgIds, clerkId }, 'Synced organizations from Clerk to MongoDB');
+                    } catch (syncError: any) {
+                        fastify.log.warn({
+                            clerkId,
+                            clerkOrgIds,
+                            error: syncError.message,
+                            stack: syncError.stack,
+                        }, 'Failed to sync organizations (non-fatal)');
+                        // Continue even if sync fails
+                    }
+                }
+
+                // Fetch corresponding MongoDB records (should all exist now after sync)
+                const orgs = await Organization.find({ clerkOrgId: { $in: clerkOrgIds } }).lean();
+
+                fastify.log.debug({
+                    clerkId,
+                    clerkOrgCount: clerkOrgIds.length,
+                    mongoOrgCount: orgs.length,
+                    clerkOrgIds,
+                    mongoOrgIds: orgs.map(o => o.clerkOrgId),
+                }, 'Fetched MongoDB organizations');
+
+                // If MongoDB returns fewer orgs than Clerk, there might be a sync issue
+                // Return MongoDB records, but log the mismatch
+                if (orgs.length < clerkOrgIds.length) {
+                    fastify.log.warn({
+                        clerkId,
+                        clerkOrgCount: clerkOrgIds.length,
+                        mongoOrgCount: orgs.length,
+                        missingOrgIds: clerkOrgIds.filter(id => !orgs.some(o => o.clerkOrgId === id)),
+                    }, 'Mismatch: Clerk has more organizations than MongoDB');
+                }
+
+                // Return MongoDB organizations (empty array if none found)
                 return orgs;
             } catch (error: any) {
-                fastify.log.error('Error fetching user organizations:', error);
+                fastify.log.error({
+                    err: error,
+                    stack: error.stack,
+                    clerkId: request.clerkId,
+                }, 'Error fetching user organizations');
                 return reply.code(500).send({
                     error: 'Failed to fetch organizations',
                     code: 'ORG_FETCH_ERROR',
+                    details: env.NODE_ENV === 'development' ? error.message : undefined,
                 });
             }
         }
@@ -469,15 +608,22 @@ export async function organizationRoutes(fastify: FastifyInstance) {
                     role: invite.role === 'admin' ? 'org:admin' : 'org:member',
                 });
 
-                // Update user with org ID and role
-                await User.findOneAndUpdate(
-                    { clerkId: request.clerkId },
-                    {
-                        role: invite.role === 'admin' ? 'admin' : user.role,
-                        orgId: org.clerkOrgId,
-                        updatedAt: new Date(),
-                    }
-                );
+                // Create Host record if it doesn't exist (accepting invite makes user a host)
+                let host = await Host.findOne({ clerkId: request.clerkId });
+                if (!host) {
+                    host = await Host.create({
+                        clerkId: request.clerkId!,
+                        userId: user._id,
+                        calendar: [],
+                        imports: [],
+                        currentView: 'host',
+                    });
+                    fastify.log.info(`Host record created for user ${request.clerkId} (invite accepted)`);
+                } else {
+                    // Ensure view is set to host
+                    host.currentView = 'host';
+                    await host.save();
+                }
 
                 // Update invitation status
                 invite.status = 'accepted';

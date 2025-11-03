@@ -1,6 +1,9 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import { createClerkClient, verifyToken } from '@clerk/backend';
 import { User } from '../models/User.js';
+import { Singer } from '../models/Singer.js';
+import { Host } from '../models/Host.js';
+import { syncUserOrganizations } from '../services/organizationSync.js';
 import { env } from '../config/env.js';
 
 // Initialize Clerk with secret key
@@ -99,6 +102,7 @@ export async function verifyClerkToken(
                     });
                 }
 
+                // Create User profile
                 user = await User.create({
                     clerkId,
                     username, // REQUIRED
@@ -108,10 +112,51 @@ export async function verifyClerkToken(
                     lastName: clerkUser.lastName || '',
                     displayName: `${clerkUser.firstName || ''} ${clerkUser.lastName || ''}`.trim() || username,
                     avatar: clerkUser.imageUrl || '',
-                    role: 'singer', // Default role
                 });
 
-                request.log.info({ clerkId, userId: user._id, username }, 'User bootstrapped successfully');
+                // Get organization memberships from Clerk
+                const clerkOrgs = await clerk.users.getOrganizationMembershipList({
+                    userId: clerkId,
+                });
+                const hasOrganization = clerkOrgs.data.length > 0;
+
+                // Sync organizations from Clerk to MongoDB (auto-create missing ones)
+                if (hasOrganization) {
+                    try {
+                        await syncUserOrganizations(clerkId);
+                        request.log.debug({ clerkId }, 'Synced organizations from Clerk to MongoDB');
+                    } catch (syncError: any) {
+                        request.log.warn({
+                            clerkId,
+                            error: syncError.message,
+                        }, 'Failed to sync organizations (non-fatal)');
+                        // Continue with user creation even if sync fails
+                    }
+                }
+
+                // Always create Singer record
+                await Singer.create({
+                    clerkId,
+                    userId: user._id,
+                    favorites: [],
+                    checkIns: [],
+                    friends: [],
+                });
+
+                // Create Host record if user has/will have organization access
+                if (hasOrganization) {
+                    await Host.create({
+                        clerkId,
+                        userId: user._id,
+                        calendar: [],
+                        imports: [],
+                        currentView: 'host', // Default to host view for org members
+                    });
+                    request.log.info({ clerkId, userId: user._id }, 'User bootstrapped as Singer + Host (org member)');
+                } else {
+                    request.log.info({ clerkId, userId: user._id }, 'User bootstrapped as Singer only');
+                }
+
             } catch (clerkError: any) {
                 request.log.error({
                     clerkId,
@@ -124,15 +169,33 @@ export async function verifyClerkToken(
             }
         }
 
-        // Get orgId from Clerk public metadata (for admin users)
-        const clerkUser = await clerk.users.getUser(clerkId);
-        const publicMetadata = clerkUser.publicMetadata as any;
-        const activeOrgId = publicMetadata.activeOrgId || user.orgId;
+        // Check if user is a Host (has access to admin features)
+        const host = await Host.findOne({ clerkId });
+        const isHost = !!host;
+
+        // Determine role and view based on Host record and preference
+        let role: 'singer' | 'admin' = 'singer';
+        let activeView: 'host' | 'guest' = 'guest';
+
+        if (isHost && host) {
+            // User is a Host - check their view preference
+            activeView = host.currentView || 'host';
+            role = activeView === 'host' ? 'admin' : 'singer';
+        }
+
+        // Get activeOrgId from Clerk if user is admin
+        let activeOrgId: string | undefined;
+        if (role === 'admin') {
+            const clerkOrgs = await clerk.users.getOrganizationMembershipList({
+                userId: clerkId,
+            });
+            activeOrgId = clerkOrgs.data[0]?.organization.id;
+        }
 
         // Attach user data to request
         request.userId = (user._id as any).toString();
         request.clerkId = clerkId;
-        request.role = user.role || 'singer';
+        request.role = role;
         request.orgId = activeOrgId;
         request.userDoc = user;
 

@@ -4,18 +4,29 @@
  * IMPORTANT: These types MUST stay in sync between frontend and backend.
  * Any changes here should be communicated to the frontend team immediately.
  *
- * Version: 2.0.0
- * Last Updated: 2024-10-08
+ * Version: 4.0.1
+ * Last Updated: 2025-11-03
  *
  * CHANGELOG:
+ * - v4.0.1: Org creation contract aligned (name, slug, logoUrl?), explicit GET/POST /api/users/me support
+ * - v4.0.0: NEW ARCHITECTURE - Singer/Host separation, role management via collections
+ * - v3.0.0: Added Catalog system (Artist, Album, multi-source Songs), Import system
  * - v2.0.0: Added Spotify integration and Playlist types
  * - v1.1.0: Added username field (REQUIRED), email now optional
+ *
+ * BREAKING CHANGES IN v4.0.0:
+ * - User no longer has role or orgId fields (profile only)
+ * - New Singer collection for singer-specific data
+ * - New Host collection for admin-specific data + view preference
+ * - Host record presence = admin access
+ * - View switching via Host.currentView instead of Clerk metadata
  */
 
 // ==========================================
 // USER TYPES
 // ==========================================
 
+// User - Profile only (v4.0.0: removed role and orgId)
 export interface User {
     _id: string;
     clerkId: string;
@@ -26,8 +37,39 @@ export interface User {
     lastName?: string;
     displayName?: string;
     avatar?: string;
-    role?: 'singer' | 'admin';
-    orgId?: string;
+    pushToken?: string;
+    createdAt: string;
+    updatedAt: string;
+}
+
+// Singer - Singer-specific data (v4.0.0: new collection)
+export interface Singer {
+    _id: string;
+    clerkId: string;
+    userId: string; // Reference to User._id
+    favorites: string[]; // Array of Song IDs
+    checkIns: Array<{
+        eventId: string;
+        timestamp: string;
+    }>;
+    friends: string[]; // Array of User IDs
+    createdAt: string;
+    updatedAt: string;
+}
+
+// Host - Admin-specific data + view preference (v4.0.0: new collection)
+export interface Host {
+    _id: string;
+    clerkId: string;
+    userId: string; // Reference to User._id
+    calendar: string[]; // Array of Event IDs
+    imports: Array<{
+        source: 'spotify' | 'csv';
+        importId?: string;
+        songIds: string[];
+        importedAt: string;
+    }>;
+    currentView: 'host' | 'guest'; // View preference for switching experiences
     createdAt: string;
     updatedAt: string;
 }
@@ -59,19 +101,26 @@ export interface Organization {
     _id: string;
     clerkOrgId: string;
     name: string;
-    ownerId: string;
+    slug: string;
+    logoUrl?: string;
     createdAt: string;
     updatedAt: string;
 }
 
 export interface CreateOrganizationRequest {
     name: string;
+    slug: string; // lowercase, hyphenated
+    logoUrl?: string;
 }
 
 export interface CreateOrganizationResponse {
-    orgId: string;
+    orgId: string; // MongoDB _id
+    clerkOrgId: string;
     name: string;
-    ownerId: string;
+    slug: string;
+    logoUrl?: string;
+    createdAt: string;
+    updatedAt: string;
 }
 
 // ==========================================
@@ -272,6 +321,16 @@ export interface ChangelogResponse {
 }
 
 // ==========================================
+// USERS (ME) ENDPOINTS
+// ==========================================
+/**
+ * Current user profile fetch
+ *
+ * GET /api/users/me   → Preferred
+ * POST /api/users/me  → Compatibility alias (some clients POST after flows)
+ */
+
+// ==========================================
 // SPOTIFY INTEGRATION
 // ==========================================
 
@@ -343,4 +402,213 @@ export interface PlaylistsResponse {
 export interface PublishPlaylistResponse {
     success: boolean;
     playlist: Playlist;
+}
+
+// ==========================================
+// CATALOG SYSTEM
+// ==========================================
+
+export interface Artist {
+    _id: string;
+    name: string;
+    name_norm: string;
+    source?: 'spotify' | 'csv' | 'manual';
+    sourceId?: string;
+    imageUrl?: string;
+    genres?: string[];
+    popularity?: number;
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface Album {
+    _id: string;
+    title: string;
+    title_norm: string;
+    artistId: string;
+    releaseYear?: number;
+    source?: 'spotify' | 'csv' | 'manual';
+    sourceId?: string;
+    imageUrl?: string;
+    genres?: string[];
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface SongSource {
+    source: 'spotify' | 'csv' | 'youtube' | 'manual';
+    sourceId: string;
+}
+
+export interface CatalogSong {
+    _id: string;
+    title: string;
+    title_norm: string;
+    artistId: string;
+    artistName: string; // Denormalized for search
+    albumId?: string;
+    albumTitle?: string; // Denormalized for search
+    durationSec?: number;
+    genres?: string[];
+    popularity?: number;
+    albumArt?: string;
+    videoUrl?: string;
+    sources: SongSource[];
+    signature: string;
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface SpotifySearchResult {
+    sourceId: string; // Spotify track ID
+    title: string;
+    artist: string;
+    albumName: string;
+    duration: number;
+    albumArt?: string;
+    spotifyUrl?: string;
+    popularity?: number;
+}
+
+export interface SpotifySearchRequest {
+    q: string;
+    limit?: number;
+}
+
+export interface SpotifySearchResponse {
+    tracks: SpotifySearchResult[];
+}
+
+export interface SaveFromSpotifyRequest {
+    trackId: string;
+}
+
+export interface SaveFromSpotifyResponse {
+    inserted: boolean;
+    song?: CatalogSong;
+    existingId?: string;
+    message?: string;
+}
+
+export interface CatalogSearchRequest {
+    q: string;
+    artistId?: string;
+    albumId?: string;
+    genre?: string;
+}
+
+export interface CatalogSearchResponse {
+    songs: Array<{
+        _id: string;
+        title: string;
+        artistName: string;
+        albumTitle?: string;
+        durationSec?: number;
+        genres?: string[];
+        albumArt?: string;
+        popularity?: number;
+        score?: number;
+    }>;
+    cached: boolean;
+}
+
+// ==========================================
+// IMPORT SYSTEM
+// ==========================================
+
+export interface AddToPlaylistRequest {
+    songId: string;
+}
+
+export interface AddToPlaylistResponse {
+    added: boolean;
+    total: number;
+    songId: string;
+}
+
+export interface GetPlaylistResponse {
+    songs: Array<{
+        _id: string;
+        title: string;
+        artistName: string;
+        albumTitle?: string;
+        durationSec?: number;
+        albumArt?: string;
+        genres?: string[];
+    }>;
+    total: number;
+}
+
+export interface CSVPreviewRequest {
+    csvData: string;
+}
+
+export interface CSVPreviewResponse {
+    draftId: string;
+    preview: Array<{
+        title: string;
+        artist: string;
+        album?: string;
+        duration?: number;
+        genre?: string;
+        rowNumber: number;
+        errors?: string[];
+    }>;
+    totalRows: number;
+    validRows: number;
+    invalidRows: number;
+    errors: Array<{ row: number; message: string }>;
+}
+
+export interface CSVCommitRequest {
+    draftId: string;
+    playlistName?: string;
+}
+
+export interface CSVCommitResponse {
+    success: boolean;
+    inserted: number;
+    updated: number;
+    errors: Array<{ row: number; message: string }>;
+    totalSaved: number;
+    invalidSongs: number;
+}
+
+// ==========================================
+// ROLE MANAGEMENT (v4.0.0: Updated for Singer/Host architecture)
+// ==========================================
+
+// Check role status (v4.0.0: new endpoint)
+export interface CheckRoleResponse {
+    isSinger: boolean;
+    isHost: boolean;
+    currentView: 'host' | 'guest';
+    effectiveRole: 'admin' | 'singer';
+    clerkOrganizations: Array<{
+        id: string;
+        name: string;
+        role: string;
+    }>;
+}
+
+// Switch view (v4.0.0: renamed from switch-role, uses Host.currentView)
+export interface SwitchViewRequest {
+    view: 'host' | 'guest';
+}
+
+export interface SwitchViewResponse {
+    success: boolean;
+    message: string;
+    currentView: string;
+    effectiveRole: string;
+    viewMode: string;
+}
+
+// Force promote to Host (v4.0.0: creates Host record)
+export interface ForcePromoteResponse {
+    success: boolean;
+    message: string;
+    isHost: boolean;
+    currentView: string;
+    hasOrganizations: boolean;
 }

@@ -36,8 +36,10 @@ export async function spotifyRoutes(fastify: FastifyInstance) {
                 }
 
                 // Get user's organization
-                const user = await clerk.users.getUser(request.userId!);
-                const orgId = (user.publicMetadata as any).activeOrgId;
+                // Use clerkId (Clerk user ID), not userId (MongoDB user ID)
+                const clerkId = request.clerkId!;
+                const user = await clerk.users.getUser(clerkId);
+                const orgId = (user.publicMetadata as any).activeOrgId || request.orgId;
 
                 if (!orgId) {
                     return reply.code(400).send({
@@ -46,15 +48,15 @@ export async function spotifyRoutes(fastify: FastifyInstance) {
                     });
                 }
 
-                request.log.info({ userId: request.userId, orgId }, 'Exchanging Spotify code for tokens');
+                request.log.info({ clerkId, orgId }, 'Exchanging Spotify code for tokens');
 
                 // Exchange code for tokens
                 const tokenResponse = await spotifyService.exchangeCodeForTokens(code, redirectUri);
 
                 // Store tokens in Clerk metadata
-                await spotifyService.storeSpotifyTokens(request.userId!, orgId, tokenResponse);
+                await spotifyService.storeSpotifyTokens(clerkId, orgId, tokenResponse);
 
-                request.log.info({ userId: request.userId, orgId }, 'Spotify connected successfully');
+                request.log.info({ clerkId, orgId }, 'Spotify connected successfully');
 
                 return {
                     success: true,
@@ -97,10 +99,12 @@ export async function spotifyRoutes(fastify: FastifyInstance) {
         async (request, reply) => {
             try {
                 // Get user's organization
-                const user = await clerk.users.getUser(request.userId!);
+                // Use clerkId (Clerk user ID), not userId (MongoDB user ID)
+                const clerkId = request.clerkId!;
+                const user = await clerk.users.getUser(clerkId);
                 const publicMetadata = user.publicMetadata as any;
                 const privateMetadata = user.privateMetadata as any;
-                const orgId = publicMetadata.activeOrgId;
+                const orgId = publicMetadata.activeOrgId || request.orgId;
 
                 if (!orgId) {
                     return {
@@ -118,21 +122,52 @@ export async function spotifyRoutes(fastify: FastifyInstance) {
                 }
 
                 // Get organization metadata
-                const org = await clerk.organizations.getOrganization({ organizationId: orgId });
-                const orgPrivateMetadata = org.privateMetadata as any;
+                // Try to get org, but handle case where org might not exist
+                try {
+                    const org = await clerk.organizations.getOrganization({ organizationId: orgId });
+                    const orgPrivateMetadata = org.privateMetadata as any;
 
-                return {
-                    connected: true,
-                    connectedBy: orgPrivateMetadata.playlistUser,
-                    connectedAt: orgPrivateMetadata.spotifyConnectedAt,
-                    scopes: privateMetadata.spotifyTokenScope?.split(' ') || [],
-                };
+                    return {
+                        connected: true,
+                        connectedBy: orgPrivateMetadata.playlistUser,
+                        connectedAt: orgPrivateMetadata.spotifyConnectedAt,
+                        scopes: privateMetadata.spotifyTokenScope?.split(' ') || [],
+                    };
+                } catch (orgError: any) {
+                    // If organization not found in Clerk, but user has tokens, return partial status
+                    if (orgError.status === 404 || orgError.message?.includes('not found')) {
+                        request.log.warn({ clerkId, orgId }, 'Organization not found in Clerk, but user has tokens');
+                        return {
+                            connected: true,
+                            connectedBy: clerkId,
+                            connectedAt: undefined,
+                            scopes: privateMetadata.spotifyTokenScope?.split(' ') || [],
+                            warning: 'Organization metadata not found',
+                        };
+                    }
+                    throw orgError;
+                }
             } catch (error: any) {
-                request.log.error({ error: error.message }, 'Failed to check Spotify status');
+                request.log.error({
+                    error: error.message,
+                    stack: error.stack,
+                    clerkId: request.clerkId,
+                    orgId: request.orgId,
+                }, 'Failed to check Spotify status');
+
+                // If it's a "not found" error, return 404 instead of 500
+                if (error.status === 404 || error.message?.toLowerCase().includes('not found')) {
+                    return reply.code(404).send({
+                        error: 'User or organization not found',
+                        code: 'NOT_FOUND',
+                        details: env.NODE_ENV === 'development' ? error.message : undefined,
+                    });
+                }
 
                 return reply.code(500).send({
                     error: 'Failed to check Spotify status',
                     code: 'SERVER_ERROR',
+                    details: env.NODE_ENV === 'development' ? error.message : undefined,
                 });
             }
         }
@@ -157,10 +192,12 @@ export async function spotifyRoutes(fastify: FastifyInstance) {
                     });
                 }
 
-                request.log.info({ userId: request.userId }, 'Refreshing Spotify token');
+                // Use clerkId (Clerk user ID), not userId (MongoDB user ID)
+                const clerkId = request.clerkId!;
+                request.log.info({ clerkId }, 'Refreshing Spotify token');
 
                 // Get valid access token (automatically refreshes if needed)
-                await spotifyService.getValidAccessToken(request.userId!);
+                await spotifyService.getValidAccessToken(clerkId);
 
                 return {
                     success: true,
@@ -203,8 +240,10 @@ export async function spotifyRoutes(fastify: FastifyInstance) {
                 }
 
                 // Get user's organization
-                const user = await clerk.users.getUser(request.userId!);
-                const orgId = (user.publicMetadata as any).activeOrgId;
+                // Use clerkId (Clerk user ID), not userId (MongoDB user ID)
+                const clerkId = request.clerkId!;
+                const user = await clerk.users.getUser(clerkId);
+                const orgId = (user.publicMetadata as any).activeOrgId || request.orgId;
 
                 if (!orgId) {
                     return reply.code(400).send({
@@ -213,10 +252,10 @@ export async function spotifyRoutes(fastify: FastifyInstance) {
                     });
                 }
 
-                request.log.info({ userId: request.userId, orgId }, 'Disconnecting Spotify');
+                request.log.info({ clerkId, orgId }, 'Disconnecting Spotify');
 
                 // Clear Spotify tokens
-                await spotifyService.clearSpotifyTokens(request.userId!, orgId);
+                await spotifyService.clearSpotifyTokens(clerkId, orgId);
 
                 return {
                     success: true,

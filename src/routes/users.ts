@@ -53,6 +53,39 @@ export async function userRoutes(fastify: FastifyInstance) {
         }
     );
 
+    // POST /api/users/me - Compatibility alias (some clients POST after flows)
+    fastify.post(
+        '/api/users/me',
+        {
+            preHandler: verifyClerkToken,
+        },
+        async (request, reply) => {
+            try {
+                const user = request.userDoc;
+
+                return {
+                    _id: user._id,
+                    clerkId: user.clerkId,
+                    username: user.username,
+                    email: user.email,
+                    phoneNumber: user.phoneNumber,
+                    firstName: user.firstName,
+                    lastName: user.lastName,
+                    displayName: user.displayName,
+                    avatar: user.avatar,
+                    createdAt: user.createdAt,
+                    updatedAt: user.updatedAt,
+                };
+            } catch (error: any) {
+                fastify.log.error('Error fetching user (POST /me):', error);
+                return reply.code(500).send({
+                    error: 'Failed to fetch user',
+                    code: 'USER_FETCH_ERROR',
+                });
+            }
+        }
+    );
+
     // PUT /api/users/me - Update current user
     fastify.put(
         '/api/users/me',
@@ -89,8 +122,6 @@ export async function userRoutes(fastify: FastifyInstance) {
                     lastName: user.lastName,
                     displayName: user.displayName,
                     avatar: user.avatar,
-                    role: user.role,
-                    orgId: user.orgId,
                     createdAt: user.createdAt,
                     updatedAt: user.updatedAt,
                 };

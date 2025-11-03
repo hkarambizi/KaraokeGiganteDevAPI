@@ -17,8 +17,8 @@ export async function devRoutes(fastify: FastifyInstance) {
 
   const logPath = join(__dirname, '../../logs/cursor.log');
   const contractsPath = join(__dirname, '../types/api-contracts.ts');
+  const changelogPath = join(__dirname, '../../docs/CHANGELOG.md');
   const docsDir = join(__dirname, '../../docs/shared');
-  const backendDocsDir = join(__dirname, '../../');
 
   // Ensure docs directory exists
   await fs.mkdir(docsDir, { recursive: true });
@@ -30,16 +30,35 @@ export async function devRoutes(fastify: FastifyInstance) {
   // POST /api/dev/changelog - Receive changelog from frontend or backend agents
   fastify.post('/api/dev/changelog', async (request, reply) => {
     const body = request.body as {
-      agent: string;
+      agent: 'frontend' | 'backend';
       timestamp: string;
-      tasks: string[];
-      notes: string[];
+      tasks?: string[];
+      notes?: string[];
       pendingRequirements?: string[];
       questions?: string[];
+      title?: string;
+      description?: string;
+      type?: string; // 'bug' | 'fix' | 'feature' | 'architecture' | etc.
     };
 
-    const { agent, timestamp, tasks, notes, pendingRequirements = [], questions = [] } = body;
+    const {
+      agent,
+      timestamp,
+      tasks = [],
+      notes = [],
+      pendingRequirements = [],
+      questions = [],
+      title,
+      description,
+      type = 'update'
+    } = body;
 
+    // Format timestamp for CHANGELOG.md (YYYY-MM-DD HH:MM UTC)
+    const date = new Date(timestamp);
+    const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD
+    const timeStr = date.toISOString().split('T')[1].split('.')[0]; // HH:MM:SS
+
+    // Legacy format for cursor.log (backward compatibility)
     const logEntry = `
 ${'='.repeat(80)}
 AGENT: ${agent}
@@ -55,48 +74,266 @@ ${questions.length > 0 ? `QUESTIONS:\n${questions.map((q) => `  ? ${q}`).join('\
 ${'='.repeat(80)}
 `;
 
+    // Format entry for CHANGELOG.md
+    let changelogEntry = '';
+
+    if (title && description) {
+      // Structured entry for CHANGELOG.md
+      const typeEmoji = {
+        bug: '🐛',
+        fix: '🔧',
+        feature: '📦',
+        architecture: '🏗️',
+        enhancement: '✨',
+        update: '📝'
+      }[type] || '📝';
+
+      changelogEntry = `\n### ${typeEmoji} ${title} (${agent === 'frontend' ? 'Frontend' : 'Backend'})\n\n`;
+      changelogEntry += `**Time:** ${timeStr} UTC  \n`;
+      changelogEntry += `**Description:** ${description}\n\n`;
+
+      if (tasks.length > 0) {
+        changelogEntry += `**Changes:**\n`;
+        tasks.forEach(task => {
+          changelogEntry += `- ${task}\n`;
+        });
+        changelogEntry += `\n`;
+      }
+
+      if (notes.length > 0) {
+        changelogEntry += `**Notes:**\n`;
+        notes.forEach(note => {
+          changelogEntry += `- ${note}\n`;
+        });
+        changelogEntry += `\n`;
+      }
+
+      if (pendingRequirements.length > 0) {
+        changelogEntry += `**Pending:**\n`;
+        pendingRequirements.forEach(req => {
+          changelogEntry += `- [ ] ${req}\n`;
+        });
+        changelogEntry += `\n`;
+      }
+
+      changelogEntry += `**Result:** ✅ Completed\n\n---\n`;
+    } else {
+      // Fallback to simple entry
+      changelogEntry = `\n### 📝 Update from ${agent === 'frontend' ? 'Frontend' : 'Backend'} (${dateStr})\n\n`;
+      changelogEntry += `**Time:** ${timeStr} UTC  \n\n`;
+
+      if (tasks.length > 0) {
+        changelogEntry += `**Tasks:**\n`;
+        tasks.forEach(task => {
+          changelogEntry += `- ${task}\n`;
+        });
+        changelogEntry += `\n`;
+      }
+
+      if (notes.length > 0) {
+        changelogEntry += `**Notes:**\n`;
+        notes.forEach(note => {
+          changelogEntry += `- ${note}\n`;
+        });
+        changelogEntry += `\n`;
+      }
+
+      changelogEntry += `---\n`;
+    }
+
     try {
+      // Ensure directories exist
       await fs.mkdir(dirname(logPath), { recursive: true });
+      await fs.mkdir(dirname(changelogPath), { recursive: true });
+
+      // Write to legacy cursor.log (backward compatibility)
       await fs.appendFile(logPath, logEntry + '\n');
-      fastify.log.info(`Changelog recorded from ${agent} agent`);
+
+      // Read current CHANGELOG.md
+      let changelogContent = '';
+      try {
+        changelogContent = await fs.readFile(changelogPath, 'utf-8');
+      } catch (error: any) {
+        if (error.code === 'ENOENT') {
+          // Create new changelog if it doesn't exist
+          changelogContent = `# 📋 Changelog - Karaoke Gigante API\n\n**Last Updated:** ${dateStr}  \n**Format:** Date/Time sorted entries with clear titles and descriptions\n\n---\n\n## ${dateStr}\n`;
+        }
+      }
+
+      // Insert new entry at the top of the current date section
+      if (changelogContent.includes(`## ${dateStr}`)) {
+        // Add to existing date section
+        const dateSectionIndex = changelogContent.indexOf(`## ${dateStr}`);
+        const nextSectionIndex = changelogContent.indexOf('\n## ', dateSectionIndex + 1);
+
+        if (nextSectionIndex === -1) {
+          // No next section, append to end
+          changelogContent = changelogContent.replace(`## ${dateStr}`, `## ${dateStr}${changelogEntry}`);
+        } else {
+          // Insert before next section
+          changelogContent = changelogContent.slice(0, nextSectionIndex) + changelogEntry + changelogContent.slice(nextSectionIndex);
+        }
+      } else {
+        // Add new date section at the top (after header)
+        const headerEnd = changelogContent.indexOf('---\n\n');
+        if (headerEnd === -1) {
+          changelogContent = changelogContent + `\n## ${dateStr}${changelogEntry}`;
+        } else {
+          changelogContent = changelogContent.slice(0, headerEnd + 5) + `## ${dateStr}${changelogEntry}` + changelogContent.slice(headerEnd + 5);
+        }
+      }
+
+      // Update "Last Updated" date
+      changelogContent = changelogContent.replace(
+        /\*\*Last Updated:\*\* .+?\n/,
+        `**Last Updated:** ${dateStr}  \n`
+      );
+
+      // Write updated CHANGELOG.md
+      await fs.writeFile(changelogPath, changelogContent, 'utf-8');
+
+      fastify.log.info(`Changelog recorded from ${agent} agent (cursor.log + CHANGELOG.md)`);
 
       return {
         success: true,
         message: 'Changelog recorded',
+        location: {
+          cursorLog: logPath,
+          changelog: changelogPath,
+        },
       };
     } catch (error: any) {
       fastify.log.error('Failed to write changelog:', error);
       return reply.code(500).send({
         error: 'Failed to write changelog',
         code: 'CHANGELOG_WRITE_ERROR',
+        details: env.NODE_ENV === 'development' ? error.message : undefined,
       });
     }
   });
 
   // GET /api/dev/changelog - Read changelog for agent communication
-  fastify.get('/api/dev/changelog', async (_request, reply) => {
+  fastify.get('/api/dev/changelog', async (request, reply) => {
     try {
-      const content = await fs.readFile(logPath, 'utf-8');
-      const stats = await fs.stat(logPath);
+      const { format } = request.query as { format?: 'legacy' | 'central' | 'both' };
 
-      return {
-        exists: true,
-        content,
-        lastModified: stats.mtime.toISOString(),
-      };
-    } catch (error: any) {
-      if (error.code === 'ENOENT') {
-        return {
-          exists: false,
-          content: null,
-          lastModified: null,
-        };
+      // Default to both for backward compatibility
+      const returnFormat = format || 'both';
+
+      if (returnFormat === 'legacy' || returnFormat === 'both') {
+        // Read legacy cursor.log
+        try {
+          const legacyContent = await fs.readFile(logPath, 'utf-8');
+          const legacyStats = await fs.stat(logPath);
+
+          if (returnFormat === 'legacy') {
+            return {
+              exists: true,
+              format: 'legacy',
+              content: legacyContent,
+              lastModified: legacyStats.mtime.toISOString(),
+            };
+          }
+
+          // Also read central changelog
+          try {
+            const centralContent = await fs.readFile(changelogPath, 'utf-8');
+            const centralStats = await fs.stat(changelogPath);
+
+            return {
+              exists: true,
+              format: 'both',
+              legacy: {
+                content: legacyContent,
+                lastModified: legacyStats.mtime.toISOString(),
+              },
+              central: {
+                content: centralContent,
+                lastModified: centralStats.mtime.toISOString(),
+              },
+            };
+          } catch (error: any) {
+            if (error.code === 'ENOENT') {
+              return {
+                exists: true,
+                format: 'legacy-only',
+                legacy: {
+                  content: legacyContent,
+                  lastModified: legacyStats.mtime.toISOString(),
+                },
+                central: {
+                  exists: false,
+                  message: 'Central changelog not found',
+                },
+              };
+            }
+            throw error;
+          }
+        } catch (error: any) {
+          if (error.code === 'ENOENT') {
+            // Try central only if format allows it
+            if (returnFormat !== 'legacy') {
+              try {
+                const centralContent = await fs.readFile(changelogPath, 'utf-8');
+                const centralStats = await fs.stat(changelogPath);
+
+                return {
+                  exists: true,
+                  format: 'central-only',
+                  central: {
+                    content: centralContent,
+                    lastModified: centralStats.mtime.toISOString(),
+                  },
+                };
+              } catch (centralError: any) {
+                if (centralError.code === 'ENOENT') {
+                  return {
+                    exists: false,
+                    content: null,
+                    lastModified: null,
+                  };
+                }
+                throw centralError;
+              }
+            }
+
+            return {
+              exists: false,
+              content: null,
+              lastModified: null,
+            };
+          }
+          throw error;
+        }
+      } else {
+        // Return central changelog only
+        try {
+          const centralContent = await fs.readFile(changelogPath, 'utf-8');
+          const centralStats = await fs.stat(changelogPath);
+
+          return {
+            exists: true,
+            format: 'central',
+            content: centralContent,
+            lastModified: centralStats.mtime.toISOString(),
+          };
+        } catch (error: any) {
+          if (error.code === 'ENOENT') {
+            return {
+              exists: false,
+              content: null,
+              lastModified: null,
+            };
+          }
+          throw error;
+        }
       }
-
+    } catch (error: any) {
       fastify.log.error('Failed to read changelog:', error);
       return reply.code(500).send({
         error: 'Failed to read changelog',
         code: 'CHANGELOG_READ_ERROR',
+        details: env.NODE_ENV === 'development' ? error.message : undefined,
       });
     }
   });
@@ -209,47 +446,29 @@ ${'='.repeat(80)}
   // GET /api/dev/docs - List all available documentation
   fastify.get('/api/dev/docs', async (_request, reply) => {
     try {
-      const backendDocs = [
-        'README.md',
-        'QUICKSTART.md',
-        'API_CONTRACTS.md',
-        'TESTING.md',
-        'CONTRACTS_SYNC.md',
-        'ENV_TEMPLATE.md',
-        'IMPLEMENTATION_SUMMARY.md',
-        'FINAL_SUMMARY.md',
-      ];
-
       const docs = [];
 
-      // Check backend docs
-      for (const filename of backendDocs) {
-        try {
-          const filePath = join(backendDocsDir, filename);
-          const stats = await fs.stat(filePath);
-          docs.push({
-            filename,
-            source: 'backend',
-            size: stats.size,
-            lastModified: stats.mtime.toISOString(),
-            path: `/api/dev/docs/${filename}`,
-          });
-        } catch (error) {
-          // File doesn't exist, skip
-        }
-      }
-
-      // Check shared docs (from frontend)
+      // Check shared docs (from frontend and backend - all in docs/shared now)
       try {
         const sharedFiles = await fs.readdir(docsDir);
         for (const filename of sharedFiles) {
+          // Skip CHANGELOG.md (has its own endpoint)
+          if (filename === 'CHANGELOG.md') continue;
+
           const filePath = join(docsDir, filename);
           const stats = await fs.stat(filePath);
 
-          if (stats.isFile()) {
+          if (stats.isFile() && filename.endsWith('.md')) {
+            // Determine source based on filename patterns
+            const isFrontendDoc = filename.includes('FRONTEND') ||
+                                  filename.includes('FOR_BACKEND') ||
+                                  filename.includes('OAUTH_CONTEXT') ||
+                                  filename.includes('MULTI_STEP') ||
+                                  filename.includes('USERNAME_VALIDATION');
+
             docs.push({
               filename,
-              source: 'frontend',
+              source: isFrontendDoc ? 'frontend' : 'backend',
               size: stats.size,
               lastModified: stats.mtime.toISOString(),
               path: `/api/dev/docs/${filename}`,
@@ -258,6 +477,22 @@ ${'='.repeat(80)}
         }
       } catch (error) {
         // Shared directory doesn't exist or is empty
+        fastify.log.warn('docs/shared directory not found or empty');
+      }
+
+      // Also include CHANGELOG.md as a special entry
+      try {
+        const changelogStats = await fs.stat(changelogPath);
+        docs.push({
+          filename: 'CHANGELOG.md',
+          source: 'both',
+          size: changelogStats.size,
+          lastModified: changelogStats.mtime.toISOString(),
+          path: '/api/dev/changelog?format=central',
+          special: true,
+        });
+      } catch (error) {
+        // Changelog doesn't exist yet
       }
 
       fastify.log.info(`Documentation list requested - ${docs.length} docs available`);
@@ -294,22 +529,22 @@ ${'='.repeat(80)}
 
     try {
       let content: string;
-      let source: 'backend' | 'frontend';
+      let source: 'backend' | 'frontend' | 'both';
       let stats: any;
 
-      // Try backend docs first
-      try {
-        const backendPath = join(backendDocsDir, filename);
-        content = await fs.readFile(backendPath, 'utf-8');
-        stats = await fs.stat(backendPath);
-        source = 'backend';
-      } catch (error) {
-        // Try shared docs (from frontend)
-        const sharedPath = join(docsDir, filename);
-        content = await fs.readFile(sharedPath, 'utf-8');
-        stats = await fs.stat(sharedPath);
-        source = 'frontend';
-      }
+      // All docs are now in docs/shared
+      const sharedPath = join(docsDir, filename);
+      content = await fs.readFile(sharedPath, 'utf-8');
+      stats = await fs.stat(sharedPath);
+
+      // Determine source based on filename patterns
+      const isFrontendDoc = filename.includes('FRONTEND') ||
+                            filename.includes('FOR_BACKEND') ||
+                            filename.includes('OAUTH_CONTEXT') ||
+                            filename.includes('MULTI_STEP') ||
+                            filename.includes('USERNAME_VALIDATION');
+
+      source = isFrontendDoc ? 'frontend' : 'backend';
 
       // Encode as base64 for safe transport
       const contentBase64 = Buffer.from(content, 'utf-8').toString('base64');

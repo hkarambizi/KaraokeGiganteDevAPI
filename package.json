@@ -6,6 +6,10 @@
 	"main": "dist/index.js",
 	"scripts": {
 		"dev": "tsx watch src/index.ts",
+		"dev:restart": "lsof -ti:3000 | xargs kill -9 2>/dev/null; pkill -9 -f 'tsx watch' 2>/dev/null; sleep 2; npm run dev",
+		"dev:logs": "tail -f logs/server.log",
+		"dev:tail": "tail -100 logs/server.log",
+		"dev:kill": "lsof -ti:3000 | xargs kill -9 2>/dev/null; pkill -9 -f 'tsx watch' 2>/dev/null; echo '✅ Killed server processes'",
 		"build": "tsc",
 		"start": "node dist/index.js",
 		"test": "vitest",
@@ -14,7 +18,8 @@
 		"test:ui": "vitest --ui",
 		"lint": "eslint src --ext .ts",
 		"typecheck": "tsc --noEmit",
-		"fix-indexes": "tsx scripts/fix-user-indexes.ts"
+		"fix-indexes": "tsx scripts/fix-user-indexes.ts",
+		"fix-clerk-user-id-index": "tsx scripts/fix-clerk-user-id-index.ts"
 	},
 	"keywords": [
 		"karaoke",
