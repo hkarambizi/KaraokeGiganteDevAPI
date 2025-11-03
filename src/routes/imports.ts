@@ -172,7 +172,15 @@ export async function importRoutes(fastify: FastifyInstance) {
         },
         async (request, reply) => {
             try {
-                await upstash.clearPlaylist(request.userId!);
+                const cleared = await upstash.clearPlaylist(request.userId!);
+
+                if (!cleared) {
+                    request.log.error({ userId: request.userId }, 'Failed to clear import playlist (Upstash returned false)');
+                    return reply.code(500).send({
+                        error: 'Failed to clear playlist',
+                        code: 'CLEAR_FAILED',
+                    });
+                }
 
                 request.log.info({ userId: request.userId }, 'Import playlist cleared');
 
@@ -225,9 +233,17 @@ export async function importRoutes(fastify: FastifyInstance) {
                 const draftId = crypto.randomBytes(16).toString('hex');
 
                 // Save draft to Redis (24h TTL)
-                await upstash.saveDraft(request.userId!, draftId, {
+                const saved = await upstash.saveDraft(request.userId!, draftId, {
                     songs: parseResult.songs,
                 });
+
+                if (!saved) {
+                    request.log.error({ userId: request.userId, draftId }, 'Failed to save CSV draft (Upstash returned false)');
+                    return reply.code(500).send({
+                        error: 'Failed to save draft',
+                        code: 'DRAFT_SAVE_FAILED',
+                    });
+                }
 
                 request.log.info(
                     {
